@@ -224,9 +224,13 @@
 
       "hyperEvmToCore"
       {:request {:type "spotClearinghouseState" :user owner}
+       ;; The credit must cover the deposited amount; HyperEVM -> Core
+       ;; moves charge no HyperCore fee.
        :applied? (fn [response baseline]
-                   (> (spot-total response (:tokenIndex action))
-                      (spot-total baseline (:tokenIndex action))))}
+                   (let [amount (or (number-of (:amount action)) js/Infinity)]
+                     (>= (- (spot-total response (:tokenIndex action))
+                            (spot-total baseline (:tokenIndex action)))
+                         (* amount (- 1 1e-6)))))}
 
       nil)))
 
@@ -354,6 +358,15 @@
 
 ;; --- HyperEVM -> HyperCore from a smart account ------------------------------------
 
+(def queued-step-message
+  (str "Part of this transfer is already queued in your smart account. Execute or reject "
+       "it there, then reload before trying again."))
+
+(defn- not-applied-result
+  [step hashes message]
+  {:status "err" :error message :step step :kind :no-hash
+   :tx-hash (peek hashes) :hashes hashes})
+
 (defn submit-evm-to-core!
   "Send the HyperEVM transactions of a `hyperEvmToCore` move from smart
    account `owner`, without waiting for receipts between them (a Safe queues
@@ -362,7 +375,8 @@
    `hyperevm-submit/submit-hyperevm-to-core!`:
 
        {:status \"ok\" :txHash :hashes}
-       {:status \"pending\" :txHash :step :hashes}   ; sent, not applied yet
+       {:status \"err\" :error :step :kind :no-hash :tx-hash :hashes}
+                                     ; sent, not applied (yet): may have been sent
        {:status \"err\" :error :step :kind :hashes}
 
    `deps`: `:provider-fn`, `:post-info!`, `:transfer-plan` `(from action)`,
@@ -422,13 +436,19 @@
                                                (if applied?
                                                  (do (doseq [{:keys [step]} items] (report! step :done))
                                                      {:status "ok" :txHash last-hash :hashes @hashes})
-                                                 {:status "pending" :txHash last-hash
-                                                  :step @step* :hashes @hashes}))))))))))
+                                                 ;; The hash may never reach the chain (a
+                                                 ;; queued Safe transaction), so the
+                                                 ;; receipt-based resolver can't settle it.
+                                                 ;; `:no-hash` marks the run "may have been
+                                                 ;; sent" and blocks another move until a
+                                                 ;; reload, so it can't be sent twice.
+                                                 (not-applied-result @step* @hashes
+                                                                     not-applied-message)))))))))))
           (.catch (fn [err]
                     (if (seq @hashes)
                       ;; An earlier transaction (e.g. the approve) is already
                       ;; queued in the account: never offer a plain retry.
-                      {:status "pending" :txHash (peek @hashes) :step @step* :hashes @hashes}
+                      (not-applied-result @step* @hashes queued-step-message)
                       (let [rejected? (user-rejected? err)]
                         (report! @step* :failed)
                         {:status "err"

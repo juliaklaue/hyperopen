@@ -192,7 +192,7 @@
       (-> (smart-account/submit-evm-to-core!
            safe
            {:type "hyperEvmToCore" :kind "usdcCoreDeposit" :tokenAddress "0xusdc" :spender "0xcdw"
-            :units "200000" :tokenIndex 0}
+            :units "200000" :amount "0.2" :tokenIndex 0}
            {:on-step! (fn [step event] (swap! steps conj [step event]))}
            (assoc deps
                   :transfer-plan (fn [_ _] plan)
@@ -224,8 +224,10 @@
                   :allowance-covers? (fn [_ _] true)))
           (.then (fn [result]
                    (is (= 1 (count @sent)))
-                   (is (= {:status "pending" :txHash "0xhash" :step :deposit :hashes ["0xhash"]}
-                          result))))
+                   (is (= {:status "err" :error smart-account/not-applied-message :step :deposit
+                           :kind :no-hash :tx-hash "0xhash" :hashes ["0xhash"]}
+                          result)
+                       "may have been sent: blocks another move instead of waiting on a receipt")))
           (.finally done)))))
 
 (deftest evm-to-core-stays-pending-when-a-later-step-fails-after-the-approve-test
@@ -245,8 +247,8 @@
                   :read-allowance! (fn [_ _ _] (js/Promise.resolve "0"))
                   :allowance-covers? (fn [_ _] false)))
           (.then (fn [result]
-                   (is (= {:status "pending" :txHash "0xapprove-hash" :step :deposit
-                           :hashes ["0xapprove-hash"]}
+                   (is (= {:status "err" :error smart-account/queued-step-message :step :deposit
+                           :kind :no-hash :tx-hash "0xapprove-hash" :hashes ["0xapprove-hash"]}
                           result)
                        "the queued approve is outstanding, so no plain retry is offered")))
           (.finally done)))))
