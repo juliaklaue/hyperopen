@@ -134,7 +134,9 @@
   [a b]
   (let [a* (number-of a)
         b* (number-of b)]
-    (boolean (and a* b* (<= (js/Math.abs (- a* b*))
+    ;; Magnitudes: the ledger signs some deltas (a Perps -> Spot class
+    ;; transfer reports a negative `usdc`); callers check the direction.
+    (boolean (and a* b* (<= (js/Math.abs (- (js/Math.abs a*) (js/Math.abs b*)))
                             (max 1e-9 (* 1e-6 (js/Math.abs b*))))))))
 
 (defn- wei->hype
@@ -236,6 +238,17 @@
 
 (def ^:private baseline-attempts 3)
 
+(defn- valid-response?
+  "Whether `response` has the shape `request` answers with. An HTTP error
+   body parses to some other map, which must never stand in for state."
+  [request response]
+  (case (:type request)
+    ("userNonFundingLedgerUpdates" "delegatorHistory") (sequential? response)
+    "spotClearinghouseState" (sequential? (:balances response))
+    "userRole" (string? (:role response))
+    "maxBuilderFee" (number? response)
+    false))
+
 (defn- read-baseline!
   "The confirmation request's answer before anything is sent. Retried a few
    times; rejects when HyperCore can't be read, so nothing is sent that we
@@ -244,9 +257,9 @@
   (letfn [(attempt [n]
             (-> (post-info! request)
                 (.then (fn [response]
-                         (if (some? response)
+                         (if (valid-response? request response)
                            response
-                           (throw (js/Error. "empty response")))))
+                           (throw (js/Error. "unexpected info response")))))
                 (.catch (fn [err]
                           (if (< n baseline-attempts)
                             (attempt (inc n))
@@ -267,6 +280,7 @@
                   (.then (fn [response]
                            (cond
                              (and (not= ::unavailable response)
+                                  (valid-response? request response)
                                   (applied? response baseline))
                              true
 

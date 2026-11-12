@@ -105,7 +105,8 @@
   (async done
     (let [unrelated {:hash "0xb" :delta {:type "send" :destination safe :token "USDC" :amount "5.0"}}
           wrong-direction {:hash "0xc" :delta {:type "accountClassTransfer" :usdc "0.3" :toPerp true}}
-          ours {:hash "0xa" :delta {:type "accountClassTransfer" :usdc "0.3" :toPerp false}}
+          ;; Perps -> Spot: the ledger signs the delta negative.
+          ours {:hash "0xa" :delta {:type "accountClassTransfer" :usdc "-0.3" :toPerp false}}
           {:keys [infos deps]} (fake-deps {:responses [[]
                                                        [unrelated]
                                                        [unrelated wrong-direction]
@@ -135,13 +136,19 @@
 
 (deftest nothing-is-sent-without-a-baseline-test
   (async done
-    (let [{:keys [sent deps]} (fake-deps {:responses [[]]})]
-      (-> (smart-account/submit-action! (store-for safe) safe
-                                        {:type "usdClassTransfer" :amount "0.3" :toPerp false}
-                                        (assoc deps :post-info! (fn [_] (js/Promise.reject (js/Error. "down")))))
+    (let [{:keys [sent deps]} (fake-deps {:responses [[]]})
+          attempt (fn [post-info!]
+                    (smart-account/submit-action! (store-for safe) safe
+                                                  {:type "usdClassTransfer" :amount "0.3" :toPerp false}
+                                                  (assoc deps :post-info! post-info!)))]
+      (-> (attempt (fn [_] (js/Promise.reject (js/Error. "down"))))
           (.then (fn [result]
                    (is (= "err" (:status result)))
                    (is (re-find #"Couldn't read your account" (:response result)))
+                   (attempt (fn [_] (js/Promise.resolve {:status "err" :response "rate limited"})))))
+          (.then (fn [result]
+                   (is (re-find #"Couldn't read your account" (:response result))
+                       "an HTTP error body is not a baseline")
                    (is (empty? @sent))))
           (.finally done)))))
 
