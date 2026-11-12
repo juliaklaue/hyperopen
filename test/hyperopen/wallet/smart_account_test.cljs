@@ -103,13 +103,46 @@
 
 (deftest transfers-are-confirmed-by-a-new-ledger-entry-test
   (async done
-    (let [{:keys [infos deps]} (fake-deps {:responses [[] [] [{:hash "0xa"}]]})]
+    (let [unrelated {:hash "0xb" :delta {:type "send" :destination safe :token "USDC" :amount "5.0"}}
+          wrong-direction {:hash "0xc" :delta {:type "accountClassTransfer" :usdc "0.3" :toPerp true}}
+          ours {:hash "0xa" :delta {:type "accountClassTransfer" :usdc "0.3" :toPerp false}}
+          {:keys [infos deps]} (fake-deps {:responses [[]
+                                                       [unrelated]
+                                                       [unrelated wrong-direction]
+                                                       [unrelated wrong-direction ours]]})]
       (-> (smart-account/submit-action! (store-for safe) safe
                                         {:type "usdClassTransfer" :amount "0.3" :toPerp false}
                                         deps)
           (.then (fn [result]
                    (is (= "ok" (:status result)))
-                   (is (= "userNonFundingLedgerUpdates" (:type (first @infos))))))
+                   (is (= "userNonFundingLedgerUpdates" (:type (first @infos))))
+                   (is (= 4 (count @infos)) "unrelated ledger changes don't count")))
+          (.finally done)))))
+
+(deftest withdraw-to-evm-is-confirmed-by-a-matching-send-test
+  (async done
+    (let [system "0x2000000000000000000000000000000000000000"
+          {:keys [deps]} (fake-deps {:responses [[]
+                                                 [{:hash "0xa" :delta {:type "send" :destination system
+                                                                       :token "USDC" :amount "0.2"}}]]})]
+      (-> (smart-account/submit-action! (store-for safe) safe
+                                        {:type "sendAsset" :destination system :sourceDex "spot"
+                                         :destinationDex "spot" :amount "0.2" :fromSubAccount ""
+                                         :token "USDC:0x6d1e7cde53ba9467b783cb7c530ce054"}
+                                        deps)
+          (.then (fn [result] (is (= "ok" (:status result)))))
+          (.finally done)))))
+
+(deftest nothing-is-sent-without-a-baseline-test
+  (async done
+    (let [{:keys [sent deps]} (fake-deps {:responses [[]]})]
+      (-> (smart-account/submit-action! (store-for safe) safe
+                                        {:type "usdClassTransfer" :amount "0.3" :toPerp false}
+                                        (assoc deps :post-info! (fn [_] (js/Promise.reject (js/Error. "down")))))
+          (.then (fn [result]
+                   (is (= "err" (:status result)))
+                   (is (re-find #"Couldn't read your account" (:response result)))
+                   (is (empty? @sent))))
           (.finally done)))))
 
 (deftest not-applied-in-time-is-reported-without-claiming-failure-test
@@ -152,13 +185,14 @@
 (deftest evm-to-core-sends-every-step-without-receipts-then-confirms-test
   (async done
     (let [{:keys [sent deps]} (fake-deps {:responses [{:balances []} {:balances []}
-                                                      {:balances [{:coin "USDC" :total "0.2"}]}]})
+                                                      {:balances [{:coin "USDC" :token 0 :total "0.2"}]}]})
           steps (atom [])
           plan [{:step :approve :optional? true :tx {:to "0xusdc" :data "0xapprove" :chainId "0x3e7" :gas "0x1"}}
                 {:step :deposit :tx {:to "0xcdw" :data "0xdeposit" :chainId "0x3e7"}}]]
       (-> (smart-account/submit-evm-to-core!
            safe
-           {:type "hyperEvmToCore" :kind "usdcCoreDeposit" :tokenAddress "0xusdc" :spender "0xcdw" :units "200000"}
+           {:type "hyperEvmToCore" :kind "usdcCoreDeposit" :tokenAddress "0xusdc" :spender "0xcdw"
+            :units "200000" :tokenIndex 0}
            {:on-step! (fn [step event] (swap! steps conj [step event]))}
            (assoc deps
                   :transfer-plan (fn [_ _] plan)
@@ -192,4 +226,27 @@
                    (is (= 1 (count @sent)))
                    (is (= {:status "pending" :txHash "0xhash" :step :deposit :hashes ["0xhash"]}
                           result))))
+          (.finally done)))))
+
+(deftest evm-to-core-stays-pending-when-a-later-step-fails-after-the-approve-test
+  (async done
+    (let [{:keys [deps]} (fake-deps {:responses [{:balances []}]})
+          calls (atom 0)
+          plan [{:step :approve :optional? true :tx {:to "0xusdc" :data "0xapprove"}}
+                {:step :deposit :tx {:to "0xcdw" :data "0xdeposit"}}]]
+      (-> (smart-account/submit-evm-to-core!
+           safe {:kind "usdcCoreDeposit" :tokenIndex 0} {}
+           (assoc deps
+                  :send-transaction! (fn [_ _ _]
+                                       (if (= 1 (swap! calls inc))
+                                         (js/Promise.resolve "0xapprove-hash")
+                                         (js/Promise.reject (doto (js/Error. "User rejected") (aset "code" 4001)))))
+                  :transfer-plan (fn [_ _] plan)
+                  :read-allowance! (fn [_ _ _] (js/Promise.resolve "0"))
+                  :allowance-covers? (fn [_ _] false)))
+          (.then (fn [result]
+                   (is (= {:status "pending" :txHash "0xapprove-hash" :step :deposit
+                           :hashes ["0xapprove-hash"]}
+                          result)
+                       "the queued approve is outstanding, so no plain retry is offered")))
           (.finally done)))))

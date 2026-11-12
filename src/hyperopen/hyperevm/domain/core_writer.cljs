@@ -245,7 +245,7 @@
                              :token (:index token*)
                              :wei wei})}))
 
-(defn- percent->decibps
+(defn percent->decibps
   "`\"0.01%\"` -> 10 (tenths of a basis point)."
   [rate]
   (units/parse-units (str/replace (str rate) #"%\s*$" "") 3))

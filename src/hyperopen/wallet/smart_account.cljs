@@ -71,6 +71,15 @@
     (when (= (normalize address) (:address entry))
       (:kind entry))))
 
+(defn may-be-smart-account?
+  "False when `address` is known not to be a smart account we would send
+   for: not the connected wallet, or already detected as an EOA."
+  [state address]
+  (let [address* (normalize address)]
+    (and (some? address*)
+         (= address* (normalize (get-in state [:wallet :address])))
+         (not= :eoa (cached-kind state address*)))))
+
 (defn- get-code!
   [address]
   (rpc/rpc-request! {} "eth_getCode" [address "latest"]))
@@ -116,34 +125,130 @@
 
 ;; --- confirmation ------------------------------------------------------------------
 
+(defn- number-of
+  [value]
+  (let [n (js/parseFloat (str value))]
+    (when-not (js/isNaN n) n)))
+
+(defn- same-amount?
+  [a b]
+  (let [a* (number-of a)
+        b* (number-of b)]
+    (boolean (and a* b* (<= (js/Math.abs (- a* b*))
+                            (max 1e-9 (* 1e-6 (js/Math.abs b*))))))))
+
+(defn- wei->hype
+  [wei]
+  (some-> (number-of wei) (/ 1e8)))
+
+(defn- entry-key
+  [entry]
+  (or (:hash entry) (pr-str entry)))
+
+(defn- new-entries
+  "Entries of `response` (a vector of `{:hash :delta}`) not in `baseline`."
+  [response baseline]
+  (let [seen (set (map entry-key baseline))]
+    (remove #(contains? seen (entry-key %)) (when (sequential? response) response))))
+
+(defn- new-delta?
+  "A predicate over `(response baseline)` that holds once a new ledger entry
+   whose delta satisfies `match?` appears."
+  [match?]
+  (fn [response baseline]
+    (boolean (some (comp match? :delta) (new-entries response baseline)))))
+
+(defn- token-name
+  [wire-id]
+  (some-> wire-id str (str/split #":" 2) first str/upper-case))
+
+(defn- spot-total
+  [response token-index]
+  (or (some (fn [{:keys [token total]}]
+              (when (= token token-index) (number-of total)))
+            (:balances response))
+      0))
+
 (defn- confirmation
-  "How to tell from the info API that HyperCore applied `action` for
-   `owner`: a request and a predicate over `(response baseline)`."
+  "How to tell from the info API that HyperCore applied this very `action`
+   for `owner`: a request and a predicate over `(response baseline)`.
+   Ledger-based checks look for a NEW entry matching the action's type,
+   amount and destination, so an unrelated change does not count."
   [action owner now-ms]
-  (case (:type action)
-    "approveAgent"
-    (let [agent (normalize (:agentAddress action))]
-      {:request {:type "userRole" :user agent}
-       :applied? (fn [response _]
-                   (and (= "agent" (:role response))
-                        (= owner (normalize (get-in response [:data :user])))))})
+  (let [ledger {:type "userNonFundingLedgerUpdates"
+                :user owner
+                :startTime (- now-ms (* 24 60 60 1000))}]
+    (case (:type action)
+      "approveAgent"
+      (let [agent (normalize (:agentAddress action))]
+        {:request {:type "userRole" :user agent}
+         :applied? (fn [response _]
+                     (and (= "agent" (:role response))
+                          (= owner (normalize (get-in response [:data :user])))))})
 
-    "hyperEvmToCore"
-    {:request {:type "spotClearinghouseState" :user owner}
-     :applied? (fn [response baseline] (not= response baseline))}
+      "usdClassTransfer"
+      {:request ledger
+       :applied? (new-delta? (fn [{:keys [type usdc toPerp]}]
+                               (and (= "accountClassTransfer" type)
+                                    (= (true? (:toPerp action)) (true? toPerp))
+                                    (same-amount? usdc (:amount action)))))}
 
-    "tokenDelegate"
-    {:request {:type "delegatorHistory" :user owner}
-     :applied? (fn [response baseline] (not= response baseline))}
+      "sendAsset"
+      {:request ledger
+       :applied? (new-delta? (fn [{:keys [type destination token amount]}]
+                               (and (contains? #{"send" "spotTransfer"} type)
+                                    (= (normalize (:destination action)) (normalize destination))
+                                    (= (token-name (:token action)) (token-name token))
+                                    (same-amount? amount (:amount action)))))}
 
-    "approveBuilderFee"
-    {:request {:type "maxBuilderFee" :user owner :builder (normalize (:builder action))}
-     :applied? (fn [response baseline] (not= response baseline))}
+      ("cDeposit" "cWithdraw")
+      {:request ledger
+       :applied? (new-delta? (fn [{:keys [type isDeposit amount]}]
+                               (and (= "cStakingTransfer" type)
+                                    (= (= "cDeposit" (:type action)) (true? isDeposit))
+                                    (same-amount? amount (wei->hype (:wei action))))))}
 
-    {:request {:type "userNonFundingLedgerUpdates"
-               :user owner
-               :startTime (- now-ms (* 24 60 60 1000))}
-     :applied? (fn [response baseline] (not= response baseline))}))
+      "tokenDelegate"
+      {:request {:type "delegatorHistory" :user owner}
+       :applied? (new-delta? (fn [{:keys [delegate]}]
+                               (and (= (normalize (:validator action))
+                                       (normalize (:validator delegate)))
+                                    (= (true? (:isUndelegate action)) (true? (:isUndelegate delegate)))
+                                    (same-amount? (:amount delegate) (wei->hype (:wei action))))))}
+
+      "approveBuilderFee"
+      (let [wanted (some-> (core-writer/percent->decibps (:maxFeeRate action)) str number-of)]
+        {:request {:type "maxBuilderFee" :user owner :builder (normalize (:builder action))}
+         :applied? (fn [response _]
+                     (boolean (and wanted (number-of response) (>= (number-of response) wanted))))})
+
+      "hyperEvmToCore"
+      {:request {:type "spotClearinghouseState" :user owner}
+       :applied? (fn [response baseline]
+                   (> (spot-total response (:tokenIndex action))
+                      (spot-total baseline (:tokenIndex action))))}
+
+      nil)))
+
+(def ^:private baseline-attempts 3)
+
+(defn- read-baseline!
+  "The confirmation request's answer before anything is sent. Retried a few
+   times; rejects when HyperCore can't be read, so nothing is sent that we
+   could not confirm."
+  [post-info! request]
+  (letfn [(attempt [n]
+            (-> (post-info! request)
+                (.then (fn [response]
+                         (if (some? response)
+                           response
+                           (throw (js/Error. "empty response")))))
+                (.catch (fn [err]
+                          (if (< n baseline-attempts)
+                            (attempt (inc n))
+                            (throw (ex-info "Couldn't read your account from Hyperliquid. Try again in a moment."
+                                            {::baseline true :cause err})))))))]
+    (attempt 1)))
 
 (defn- sleep!
   [ms]
@@ -217,8 +322,7 @@
                    :now-ms now})
             check (confirmation action owner* now)
             provider (provider-fn)]
-        (-> (post-info! (:request check))
-            (.catch (fn [_] nil))
+        (-> (read-baseline! post-info! (:request check))
             (.then (fn [baseline]
                      (-> (ensure-wallet-chain! provider wallet-chain-config)
                          (.then (fn [_]
@@ -228,17 +332,20 @@
                                                       :value "0x0"
                                                       :chainId (:chain-id chain/mainnet)})))
                          (.then (fn [tx-hash]
-                                  (when (fn? on-sent!) (on-sent! tx-hash))
+                                  ;; Sent: from here on the outcome is applied
+                                  ;; or not-yet-applied, never a plain failure.
+                                  (try (when (fn? on-sent!) (on-sent! tx-hash)) (catch :default _ nil))
                                   (-> (poll-until-applied! deps* check baseline)
                                       (.then (fn [applied?]
                                                (if applied?
                                                  {:status "ok" :tx-hash tx-hash}
-                                                 (failure not-applied-message)))))))
-                         (.catch (fn [err]
-                                   (failure (if (user-rejected? err)
-                                              "You rejected the transaction in your wallet."
-                                              (str "Your smart account couldn't send the transaction: "
-                                                   (error-message err)))))))))))
+                                                 (failure not-applied-message))))))))))
+            (.catch (fn [err]
+                      (failure (cond
+                                 (::baseline (ex-data err)) (ex-message err)
+                                 (user-rejected? err) "You rejected the transaction in your wallet."
+                                 :else (str "Your smart account couldn't send the transaction: "
+                                            (error-message err))))))))
       (catch :default err
         (js/Promise.resolve
          (failure (if (core-writer/refused? err)
@@ -272,16 +379,17 @@
                      deps
                      {:now-ms-fn now-ms-fn})
         owner* (normalize owner)
-        report! (fn [step event] (when (fn? on-step!) (on-step! step event)))
+        report! (fn [step event]
+                  (try (when (fn? on-step!) (on-step! step event)) (catch :default _ nil)))
         hashes (atom [])
         step* (atom :switch-network)
-        check (confirmation {:type "hyperEvmToCore"} owner* (now-ms-fn))
+        check (confirmation (assoc action :type "hyperEvmToCore") owner* (now-ms-fn))
         plan (try (transfer-plan owner* action) (catch :default _ nil))]
     (if-not (and (seq plan) (every? :tx plan))
       (js/Promise.resolve {:status "err" :error "This transfer can't be encoded."
                            :step nil :kind :invalid :hashes []})
       (-> (js/Promise.all
-           #js [(-> (post-info! (:request check)) (.catch (fn [_] nil)))
+           #js [(read-baseline! post-info! (:request check))
                 (if (some :optional? plan)
                   (-> (read-allowance! (:tokenAddress action) owner* (:spender action))
                       (.then (fn [allowance] (allowance-covers? allowance (:units action))))
@@ -317,13 +425,18 @@
                                                  {:status "pending" :txHash last-hash
                                                   :step @step* :hashes @hashes}))))))))))
           (.catch (fn [err]
-                    (let [rejected? (user-rejected? err)]
-                      (report! @step* :failed)
-                      {:status "err"
-                       :error (if rejected?
-                                "You rejected the transaction in your wallet."
-                                (str "Your smart account couldn't send the transaction: "
-                                     (error-message err)))
-                       :step @step*
-                       :kind (if rejected? :rejected :wallet)
-                       :hashes @hashes})))))))
+                    (if (seq @hashes)
+                      ;; An earlier transaction (e.g. the approve) is already
+                      ;; queued in the account: never offer a plain retry.
+                      {:status "pending" :txHash (peek @hashes) :step @step* :hashes @hashes}
+                      (let [rejected? (user-rejected? err)]
+                        (report! @step* :failed)
+                        {:status "err"
+                         :error (cond
+                                  (::baseline (ex-data err)) (ex-message err)
+                                  rejected? "You rejected the transaction in your wallet."
+                                  :else (str "Your smart account couldn't send the transaction: "
+                                             (error-message err)))
+                         :step @step*
+                         :kind (if rejected? :rejected :wallet)
+                         :hashes @hashes}))))))))

@@ -101,11 +101,13 @@
    the same transactions without waiting for receipts in between, then
    waits for HyperCore to credit the move."
   [store owner action opts]
-  (-> (smart-account/detect! store owner)
-      (.then (fn [smart?]
-               (if smart?
-                 (smart-account/submit-evm-to-core! owner action opts (smart-account-deps))
-                 (hyperevm-submit/submit-hyperevm-to-core! (submit-deps store) owner action opts))))))
+  (if-not (smart-account/may-be-smart-account? @store owner)
+    (hyperevm-submit/submit-hyperevm-to-core! (submit-deps store) owner action opts)
+    (-> (smart-account/detect! store owner)
+        (.then (fn [smart?]
+                 (if smart?
+                   (smart-account/submit-evm-to-core! owner action opts (smart-account-deps))
+                   (hyperevm-submit/submit-hyperevm-to-core! (submit-deps store) owner action opts)))))))
 
 (defn refresh-spot-clearinghouse!
   "Re-read `owner`'s Spot balances after a HyperEVM move. `[:spot

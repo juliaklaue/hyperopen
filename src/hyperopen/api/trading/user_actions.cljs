@@ -99,12 +99,14 @@
    `sign-and-post!`. `->result` adapts the smart-account result to what the
    caller of the signed path expects."
   [store address action ->result sign-and-post!]
-  (-> (smart-account/detect! store address)
-      (.then (fn [smart?]
-               (if smart?
-                 (-> (smart-account/submit-action! store address action (smart-account-deps))
-                     (.then ->result))
-                 (sign-and-post!))))))
+  (if-not (smart-account/may-be-smart-account? @store address)
+    (sign-and-post!)
+    (-> (smart-account/detect! store address)
+        (.then (fn [smart?]
+                 (if smart?
+                   (-> (smart-account/submit-action! store address action (smart-account-deps))
+                       (.then ->result))
+                   (sign-and-post!)))))))
 
 (defn- json-response
   [result]
