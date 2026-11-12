@@ -29,6 +29,7 @@
             [hyperopen.wallet.agent-safety :as agent-safety]
             [hyperopen.wallet.address-watcher :as address-watcher]
             [hyperopen.wallet.core :as wallet]
+            [hyperopen.wallet.smart-account :as smart-account]
             [hyperopen.websocket.client :as ws-client]))
 
 (defn render-app!
@@ -126,7 +127,8 @@
 
 (defn bootstrap-runtime!
   [{:keys [runtime store]}]
-  (bootstrap-runtime-once! runtime store))
+  (bootstrap-runtime-once! runtime store)
+  (smart-account/install-detection-watch! store))
 
 (defn ensure-runtime-bootstrapped!
   [runtime bootstrap-fn]

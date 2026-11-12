@@ -87,12 +87,14 @@
      :mobile-label button-label}))
 
 (defn- enable-trading-vm
-  [agent-state]
+  [agent-state smart-account?]
   (let [status (:status agent-state)
         disabled? (boolean (#{:approving :unlocking} status))]
     (when (not= :ready status)
       {:label (case status
-                :approving "Awaiting signature..."
+                :approving (if smart-account?
+                             "Awaiting smart account..."
+                             "Awaiting signature...")
                 :locked "Unlock Trading"
                 :unlocking "Awaiting passkey..."
                 "Enable Trading")
@@ -116,7 +118,8 @@
      :copy-action [[:actions/copy-wallet-address]]
      :disconnect-action [[:actions/disconnect-wallet]]
      :agent-error (some-> wallet-state :agent :error str not-empty)
-     :enable-trading (enable-trading-vm (:agent wallet-state))
+     :enable-trading (enable-trading-vm (:agent wallet-state)
+                                        (= :contract (get-in wallet-state [:smart-account :kind])))
      :connect-action [[:actions/connect-wallet]]}))
 
 (defn- trading-settings-storage-mode

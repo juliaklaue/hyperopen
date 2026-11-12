@@ -263,7 +263,10 @@
                 (entry-block (hyperevm-balances/entry state owner))
                 empty-block
                 (if evm->core?
-                  (gas-block state owner token)
+                  ;; A smart account's owners pay the HyperEVM gas when
+                  ;; they execute; the account itself needs no HYPE.
+                  (when-not (= :contract (get-in state [:wallet :smart-account :kind]))
+                    (gas-block state owner token))
                   (core-fee-block state token))
                 (when (and evm->core? (= :missing status) (not= :usdc-cdw (:kind token)))
                   (block :core-account-missing (:core-account-missing messages)))

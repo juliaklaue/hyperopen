@@ -8,17 +8,20 @@
    is on. Only signing and sending go through the wallet."
   (:require [hyperopen.api.default :as api]
             [hyperopen.api.projections :as api-projections]
+            [hyperopen.api.trading.http :as trading-http]
             [hyperopen.funding.application.hyperevm-submit :as hyperevm-submit]
             [hyperopen.funding.domain.transfer-run :as transfer-run]
             [hyperopen.funding.infrastructure.wallet-rpc :as wallet-rpc]
             [hyperopen.hyperevm.domain.abi :as abi]
             [hyperopen.hyperevm.domain.chain :as chain]
             [hyperopen.hyperevm.domain.transfer-state :as transfer-state]
+            [hyperopen.hyperevm.domain.txs :as txs]
             [hyperopen.hyperevm.domain.units :as units]
             [hyperopen.hyperevm.infrastructure.rpc :as rpc]
             [hyperopen.platform :as platform]
             [hyperopen.telemetry :as telemetry]
-            [hyperopen.wallet.core :as wallet]))
+            [hyperopen.wallet.core :as wallet]
+            [hyperopen.wallet.smart-account :as smart-account]))
 
 (def wallet-chain-config
   "HyperEVM as the wallet sees it: HYPE as native currency for
@@ -83,11 +86,26 @@
     :record-in-flight! (record-in-flight! store)
     :now-ms-fn now-ms-fn}))
 
+(defn- smart-account-deps
+  []
+  {:provider-fn wallet/provider
+   :post-info! (fn [body] (-> (trading-http/post-info! body) (.then trading-http/parse-json!)))
+   :transfer-plan txs/transfer-plan
+   :read-allowance! (fn [token-address owner spender]
+                      (read-allowance! {} token-address owner spender))
+   :allowance-covers? txs/allowance-covers?})
+
 (defn submit-hyperevm-to-core-tx!
   "`(submit store owner action opts)`: the HyperEVM -> Core submitter bound
-   to the real wallet and RPC."
+   to the real wallet and RPC. A smart-contract account (e.g. a Safe) sends
+   the same transactions without waiting for receipts in between, then
+   waits for HyperCore to credit the move."
   [store owner action opts]
-  (hyperevm-submit/submit-hyperevm-to-core! (submit-deps store) owner action opts))
+  (-> (smart-account/detect! store owner)
+      (.then (fn [smart?]
+               (if smart?
+                 (smart-account/submit-evm-to-core! owner action opts (smart-account-deps))
+                 (hyperevm-submit/submit-hyperevm-to-core! (submit-deps store) owner action opts))))))
 
 (defn refresh-spot-clearinghouse!
   "Re-read `owner`'s Spot balances after a HyperEVM move. `[:spot

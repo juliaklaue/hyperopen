@@ -4,7 +4,8 @@
             [hyperopen.api.trading.http :as http]
             [hyperopen.trading-crypto-modules :as trading-crypto-modules]
             [hyperopen.wallet.agent-session :as agent-session]
-            [hyperopen.wallet.provider-registry :as provider-registry]))
+            [hyperopen.wallet.provider-registry :as provider-registry]
+            [hyperopen.wallet.smart-account :as smart-account]))
 
 (defn parse-chain-id-int
   [value]
@@ -85,7 +86,32 @@
     (swap! store assoc-in [:wallet :user-signed-nonce-cursor] nonce)
     nonce))
 
-(defn approve-agent!
+(defn- smart-account-deps
+  []
+  {:provider-fn provider-registry/provider
+   :post-info! (fn [body]
+                 (-> (http/post-info! body)
+                     (.then http/parse-json!)))})
+
+(defn- when-smart-account
+  "Send `action` through CoreWriter when `address` is a smart-contract
+   account (it cannot sign the EIP-712 payload); otherwise run
+   `sign-and-post!`. `->result` adapts the smart-account result to what the
+   caller of the signed path expects."
+  [store address action ->result sign-and-post!]
+  (-> (smart-account/detect! store address)
+      (.then (fn [smart?]
+               (if smart?
+                 (-> (smart-account/submit-action! store address action (smart-account-deps))
+                     (.then ->result))
+                 (sign-and-post!))))))
+
+(defn- json-response
+  [result]
+  (js/Response. (js/JSON.stringify (clj->js result))
+                #js {:status 200 :headers #js {"content-type" "application/json"}}))
+
+(defn- sign-and-approve-agent!
   [store address action]
   (let [action* (atom action)
         crypto-promise (trading-crypto-modules/load-trading-crypto-module!)]
@@ -107,7 +133,12 @@
                    (or (debug-exchange-simulator/simulated-fetch-response [[:approveAgent]])
                        (http/json-post! http/exchange-url payload))))))))
 
-(defn- sign-and-post-user-action!
+(defn approve-agent!
+  [store address action]
+  (when-smart-account store address action json-response
+                      #(sign-and-approve-agent! store address action)))
+
+(defn- sign-and-post-user-action!*
   [store address action nonce-field sign-action-key]
   (let [nonce (next-user-signed-nonce! store)
         action* (atom nil)
@@ -133,6 +164,11 @@
                                   :v v}]
                    (-> (http/post-signed-action! @action* nonce signature)
                        (.then http/parse-json!))))))))
+
+(defn- sign-and-post-user-action!
+  [store address action nonce-field sign-action-key]
+  (when-smart-account store address action identity
+                      #(sign-and-post-user-action!* store address action nonce-field sign-action-key)))
 
 (defn submit-usd-class-transfer! [store address action]
   (sign-and-post-user-action! store address action :nonce :sign-usd-class-transfer-action!))
